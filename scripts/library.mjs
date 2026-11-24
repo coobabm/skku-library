@@ -70,7 +70,7 @@ async function follow(page, url, file) {
     p.waitForEvent('download',{timeout:58000}).then(d=>{artifact=d;},()=>{});
   }
   arm(page);
-  try {await page.goto(url,{timeout:22000});}catch(e){if(!artifact && !/download|abort/i.test(e.message))throw e;}
+  try {if(url)await page.goto(url,{timeout:22000});}catch(e){if(!artifact && !/download|abort/i.test(e.message))throw e;}
   const clicked=new Set();
   const deadline=Date.now()+45000;
   let loginSince=0;
@@ -81,9 +81,52 @@ async function follow(page, url, file) {
       loginSince ||= Date.now();
       if(Date.now()-loginSince>2500){await task.handOff();fail('login_required','请在 Ego Lite 当前窗口完成学校登录，然后使用返回的 space 继续。');}
     } else {loginSince=0;}
+    const pdf=await page.evaluate(()=>document.contentType==='application/pdf' || !!document.querySelector('embed[type="application/pdf"]'));
+    if(pdf && /^https?:$/.test(here.protocol)){
+      await page.fetch(here.href,{saveAs:file,timeout:25000});return;
+    }
+    const advertised=await page.evaluate(()=>{
+      const links=[...document.querySelectorAll('a[href]')].filter(a=>a.getClientRects().length);
+      const sd=/^\/science\/article\/pii\/(S[A-Z0-9]+)\/?$/i.exec(location.pathname);
+      if(sd && /sciencedirect[.-]/.test(location.hostname)){
+        const paths=[location.pathname.replace(/\/$/,'')+'/pdfft',location.pathname.replace(/\/$/,'')+'/pdf'];
+        const link=links.find(a=>a.origin===location.origin && paths.includes(a.pathname));
+        if(link){link.dataset.skkuPrimaryPdf='true';return link.href;}
+        return null;
+      }
+      if(location.hostname==='journals.plos.org'){
+        const a=document.querySelector('a#downloadPdf[href]');
+        const doi=new URL(location.href).searchParams.get('id');
+        if(doi && a && a.origin===location.origin && new URL(a.href).searchParams.get('id')===doi)return a.href;
+      }
+      const meta=document.querySelector('meta[name="citation_pdf_url" i]')?.content;
+      if(!meta)return null;
+      const expected=new URL(meta,location.href);
+      return expected.origin===location.origin && links.some(a=>a.href===expected.href)?expected.href:null;
+    });
+    if(advertised && !clicked.has(advertised)){
+      clicked.add(advertised);
+      try{
+        await page.fetch(advertised,{saveAs:file,timeout:12000});
+        const handle=await fs.open(file,'r');
+        try{const head=Buffer.alloc(5);await handle.read(head,0,5,0);if(head.toString()==='%PDF-')return;}
+        finally{await handle.close();}
+      }catch(e){if(/control|inactive|unassigned/i.test(e.message))throw e;}
+    }
+    const sdArticle=/sciencedirect[.-]/.test(here.hostname) && /^\/science\/article\/pii\/[^/]+\/?$/.test(here.pathname);
+    if(sdArticle){
+      if(advertised && !clicked.has('primary:'+advertised)){
+        clicked.add('primary:'+advertised);
+        const popup=page.waitForEvent('popup',{timeout:3500}).catch(()=>null);
+        await page.click('[data-skku-primary-pdf="true"]',{label:'打开本篇论文 PDF'});
+        const child=await popup;
+        if(child){page=child;arm(page);}
+      }else{await new Promise(r=>setTimeout(r,350));}
+      continue;
+    }
     const snap=await page.snapshot({scope:'full_page'});
     // Use exact visible action names, including the DBpia institutional-login dismissal.
-    const labels=['바로 이용하기','원본 다운받기','PDF 다운로드','Download PDF','다운받기','PDF Download','Download full text','원문보기','View PDF','PDF'];
+    const labels=['바로 이용하기','원본 다운받기','PDF 다운로드','Download PDF','다운받기','다운로드','원문 다운로드','원문 보기','PDF Download','Download full text','원문보기','View PDF','Download article PDF','View article PDF','PDF (opens in a new window)','Download this article as a PDF','PDF 다운로드하기','PDF 보기','PDF 다운로드 받기','PDF'];
     let acted=false;
     for(const label of labels){
       const mark=page.label+' '+here.pathname+' '+label;
@@ -92,22 +135,16 @@ async function follow(page, url, file) {
       if(clicked.has(mark) || (!matching && !lines.some(s=>s.trim()==='text "'+label+'"')))continue;
       const selector=matching?'@'+matching.match(/\[ref=(\d+)/)[1]:'text="'+label+'"';
       clicked.add(mark);
-      const priorTabs=new Set((await task.tabs()).map(t=>t.targetId));
+      const popup=await trackPopup(page);
       await page.click(selector,{label:'打开论文下载选项'});
-      if(label==='원문보기'||label==='View PDF'||label==='PDF'){
-        for(let i=0;i<16&&!artifact;i++){
-          const child=(await task.tabs()).find(t=>!priorTabs.has(t.targetId)&&t.openedBy!=='user');
-          if(child){page=child.label?task.page(child.label):await task.adopt(child.page);arm(page);break;}
-          await new Promise(r=>setTimeout(r,200));
-        }
+      for(let i=0;i<16&&!artifact;i++){
+        const child=await popup();
+        if(child){page=child;arm(page);break;}
+        await new Promise(r=>setTimeout(r,200));
       }
       acted=true;break;
     }
     if(!acted){
-      const pdf=await page.evaluate(()=>document.contentType==='application/pdf' || !!document.querySelector('embed[type="application/pdf"]'));
-      if(pdf && /^https?:$/.test(here.protocol)){
-        await page.fetch(here.href,{saveAs:file,timeout:25000});return;
-      }
       await new Promise(r=>setTimeout(r,400));
     }
   }
@@ -146,9 +183,28 @@ async function main(){
     task=entry.ownership==='agentDelegatedToUser'?await takeOverTaskSpace(args.space):entry.ownership==='user'?await claimTaskSpace(args.space):await taskSpace(args.space);
   }else{task=await taskSpace('SKKU library '+randomUUID().slice(0,8));}
   const tabs=await task.tabs();
-  const tab=tabs.find(t=>t.url.startsWith(origin+'/search'))||tabs.find(t=>t.url==='about:blank');
+  const tab=tabs.find(t=>t.url.startsWith(origin+'/search'))||tabs.find(t=>t.url.startsWith(origin+'/'))||tabs.find(t=>t.url==='about:blank');
   const page=tab?(tab.label?task.page(tab.label):await task.adopt(tab.page)):await task.newPage();
-  if(!((await page.url()).startsWith(origin+'/')))await page.goto(origin+'/search?'+new URLSearchParams({q:args.query}));
+  if(!((await page.url()).startsWith(origin+'/')))await page.goto(origin+'/search?'+new URLSearchParams({q:args.query||''}));
+  if(['sources','open-source','site-search','site-download'].includes(args.action))return catalogAction(page);
+  if(args.action==='download' && /^doi:10\.\d{4,9}\/[^\s]+$/i.test(args.id)){
+    const doi=args.id.slice(4);
+    const doiURL='https://doi.org/'+doi.split('/').map(encodeURIComponent).join('/');
+    const campus=/^\/(suwon|nsc)/.test(new URL(await page.url()).pathname)?2:1;
+    const url=origin+'/pyxis-api/'+campus+'/proxy-redirect?'+new URLSearchParams({returnUrl:doiURL});
+    return saveFromEntry(await task.newPage(),url);
+  }
+  if(args.action==='download' && /^pubmed:\d+$/.test(args.id)){
+    const pub=await task.newPage();
+    const pmid=args.id.slice(7);
+    await pub.goto('https://pubmed.ncbi.nlm.nih.gov/'+pmid+'/');
+    const url=await pub.evaluate(()=>{
+      const links=[...document.querySelectorAll('.full-text-links-list a[href]')];
+      return (links.find(a=>/pubmed central|pmc/i.test(a.textContent+' '+a.title+' '+a.href))||links[0])?.href;
+    });
+    if(!url)fail('no_full_text','PubMed 记录中没有全文入口。');
+    return saveFromEntry(pub,url);
+  }
   const results=await lookup(page);
   if(args.action==='download')return await download(page,results.items.find(r=>r.id===args.id));
   const items=args.kind==='papers'?await cleanFields(page,results.items):results.items;
@@ -156,8 +212,8 @@ async function main(){
 }
 try{
   const result=await main();
-  console.log('SKKU_RESULT '+JSON.stringify({status:'ok',...result,...(!args.space?{_finish:task.spaceId}:{space:task.spaceId})}));
+  console.log('SKKU_RESULT '+JSON.stringify({status:'ok',...result,...(!args.space && args.action!=='open-source'?{_finish:task.spaceId}:{space:task.spaceId})}));
 }catch(e){
-  const known=['api_error','invalid_pdf','file_exists','login_required','no_download','record_not_found','no_full_text','space_missing'];
+  const known=['api_error','invalid_pdf','file_exists','login_required','no_download','record_not_found','no_full_text','space_missing','source_missing','catalog_incomplete','no_entry','site_search_unavailable','site_results_unrecognized'];
   console.log('SKKU_RESULT '+JSON.stringify({status:'error',code:known.includes(e.code)?e.code:'ego_error',message:known.includes(e.code)?e.message:'Ego Lite 未能完成页面操作，请检查当前窗口。',space:task?.spaceId}));
 }
