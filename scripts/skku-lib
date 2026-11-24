@@ -1,0 +1,59 @@
+#!/usr/bin/env python3
+"""Agent CLI for the SKKU library, using the current Ego Lite profile."""
+import argparse
+import json
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+
+def run_ego(program):
+    result = subprocess.run(['ego-browser', 'nodejs'], input=program, text=True, capture_output=True, timeout=180)
+    for line in reversed((result.stdout + '\n' + result.stderr).splitlines()):
+        if line.startswith('SKKU_RESULT '):
+            return json.loads(line.removeprefix('SKKU_RESULT '))
+    return {'status':'error', 'code':'ego_unavailable', 'message':'Ego Lite 未返回结果。请查看浏览器是否在等待操作。'}
+
+
+def main():
+    parser = argparse.ArgumentParser(description='用 Ego Lite 的学校登录态搜索 SKKU、下载论文 PDF。命令返回 JSON。')
+    cmds = parser.add_subparsers(dest='action', required=True)
+    search = cmds.add_parser('search')
+    search.add_argument('--kind', choices=['papers','books','journals'], default='papers')
+    search.add_argument('--collection', type=int, choices=[1,5,6,7,47,128], default=1)
+    download = cmds.add_parser('download')
+    download.add_argument('--id', required=True, help='搜索返回的论文记录 ID')
+    download.add_argument('--out', required=True, type=Path)
+    for cmd in [search,download]:
+        cmd.add_argument('query')
+        cmd.add_argument('--page', default=1, type=int)
+        cmd.add_argument('--limit', default=5, type=int)
+        cmd.add_argument('--space', type=int, help='继续本任务已有的 Ego Lite 空间')
+    args = vars(parser.parse_args())
+    if not args['query'].strip() or min(args['page'],args['limit']) < 1:
+        parser.error('请输入关键词、正整数页码和条数')
+    if 'out' in args:
+        dest = args['out'].expanduser().absolute()
+        if dest.exists():
+            return {'status':'error','code':'file_exists','path':str(dest)}
+        args['out'] = str(dest)
+    if not shutil.which('ego-browser'):
+        return {'status':'error','code':'ego_missing','message':'找不到 ego-browser。'}
+    script = Path(__file__).resolve().with_name('library.mjs').read_text()
+    result = run_ego('const args = '+json.dumps(args, ensure_ascii=True)+';\n'+script)
+    space = result.pop('_finish', None)
+    if space is not None:
+        cleanup = run_ego(f'const t = await taskSpace({int(space)}); await t.finish({{keep:[]}}); console.log(\'SKKU_RESULT {{"ok":true}}\');')
+        if not cleanup.get('ok'):
+            result['cleanup_pending_space'] = space
+    return result
+
+
+if __name__ == '__main__':
+    try:
+        result = main()
+    except (OSError, subprocess.TimeoutExpired, ValueError) as err:
+        result = {'status':'error','code':'runtime_error','message':type(err).__name__}
+    print(json.dumps(result,ensure_ascii=False))
+    sys.exit(0 if result.get('status') == 'ok' else 1)
